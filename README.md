@@ -34,16 +34,22 @@ level-aware model scores 0.38.
   bandwidth — big launches have tighter curves than small ones, so a pooled
   spread over-covers them. Spreads are floored at 0.05 and fall back to the
   pooled residual SD when the local weights degenerate.
+- The median is centred by a **leave-one-out bias correction** (v4): weighted
+  least squares predicts the conditional *mean*, but the scored τ=0.5 pinball
+  wants the *median*, and right-skewed residuals (small launches whose evenings
+  explode ×100–2000) push the mean above the median, so v3 over-predicted the
+  typical launch by +10–20%. Each hour adds 0.5 × the kernel-weighted median
+  of leave-one-out residuals at the target's log hour-1 print.
 - Everything is computed from the case file at run time; the fitted constants
-  (bandwidth 1.5, clamp pad 0.5, spread multiplier 1.0) were tuned on the
+  (bandwidth 1.5, clamp pad 0.5, spread multiplier 1.0, bias shrink 0.5) were tuned on the
   leave-one-out backtest over the comparables (see `analysis/`). With fewer
   than 8 usable comparables the model falls back to persistence with the
   house baseline's spread.
 
 Leave-one-out backtest over the comparables (148 pseudo-cases, 17,020 items):
-mean pinball loss **0.382** (house baseline **0.930** on the same launches),
-typical miss 78.6% (baseline 213%), 90% coverage 0.888. By hour-1 size:
-small launches 0.635, mid 0.279, big 0.212 — the big-launch slice is the one
+mean pinball loss **0.376** (house baseline **0.930** on the same launches),
+typical miss 75.5% (baseline 213%), 90% coverage 0.891. By hour-1 size:
+small launches 0.623, mid 0.276, big 0.210 — the big-launch slice is the one
 most relevant to GTA VI.
 
 ## Run it
