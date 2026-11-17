@@ -16,6 +16,20 @@
 //   fit beat it on loss, miss and coverage, so v2 uses it; v3 keeps the local-linear
 //   median and makes the spread local too (see Spreads below), 0.382 vs 0.404 pooled.
 //
+//   v4 adds a leave-one-out median-residual bias correction (see looBiasCorrection
+//   below), shrunk by BIAS_SHRINK = 0.5. Weighted least squares predicts the
+//   conditional MEAN of r_h, but the scored tau = 0.5 pinball wants the conditional
+//   MEDIAN, and the residual distribution is right-skewed (small launches whose
+//   evenings explode x100-x2000), so the mean sits above the median and v3's median
+//   forecast over-predicts the typical launch by +10-20% at most hours (median
+//   signed log error +0.10 to +0.20; hi-tertile +0.215 at h10). The correction
+//   centres the median: LOO backtest 0.382 -> 0.376 overall, hi-tertile 0.212 ->
+//   0.210, typical miss 78.6% -> 75.5%, coverage 0.888 -> 0.891. The gain is small
+//   and not statistically significant (paired t = -1.31 overall, -0.42 hi, n = 37
+//   unique launches); it is shipped on mechanism plus a consistent small win, not
+//   on a significant test. Everything else stays at v3 (tau 1.5, pad 0.5, local
+//   spread x1.0, no pre-release anchor, no console weight, no quadratic median).
+//
 //   Spreads: per-hour residual sigma of the local-linear fit (residuals evaluated at
 //   each comparable's own log hour-1 print), times SPREAD_MULT. q_tau is then
 //   median * exp(z_tau * sigma_h). The log(viewers_1) the fit is evaluated at is
@@ -41,7 +55,7 @@
 //   collapse onto the least similar launches.
 //
 //   No randomness, no clock, no network: a pure function of the case file.
-//   Fitted constants (LOCAL_TAU, LEVEL_PAD, SPREAD_MULT) were chosen on the
+//   Fitted constants (LOCAL_TAU, LEVEL_PAD, SPREAD_MULT, BIAS_SHRINK) were chosen on the
 //   leave-one-out backtest over the kit's comparables (see analysis/TUNING.md).
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -64,6 +78,10 @@ const LOCAL_TAU = 1.5;
 const LEVEL_PAD = 0.5;
 /** Global multiplier on the per-hour residual sigma. Fit on backtest (90% coverage ~0.89 at 1.0). */
 const SPREAD_MULT = 1.0;
+/** Shrink on the leave-one-out median-residual bias correction. 0.5 halves the
+ *  unshrunk correction's hi-tertile h3-h4 overshoot while keeping most of the
+ *  h9-h13 fix; the shrink sweep (0.25 / 0.5 / 0.75) is a flat plateau. */
+const BIAS_SHRINK = 0.5;
 /** Floor on the per-hour log spread, so a degenerate fit cannot produce equal quantiles. */
 const SIGMA_FLOOR = 0.05;
 
@@ -159,6 +177,7 @@ function wols(pts: [number, number][], w: number[]): { mx: number; my: number; s
  * median of r_h when there are too few points or the weights degenerate.
  */
 function localLinearAt(pts: [number, number][], x0: number): number {
+  if (pts.length === 0) return 0; // No comparable has this hour: no information, persist hour 1.
   if (pts.length < 5) return median(pts.map(([, r]) => r));
   const xs = pts.map(([x]) => x);
   const x = clamp(x0, Math.min(...xs) - LEVEL_PAD, Math.max(...xs) + LEVEL_PAD);
@@ -166,6 +185,57 @@ function localLinearAt(pts: [number, number][], x0: number): number {
   const fit = wols(pts, w);
   if (fit === null) return median(pts.map(([, r]) => r));
   return fit.my + fit.slope * (x - fit.mx);
+}
+
+/**
+ * Kernel-weighted median of a set of {value, weight} pairs: sort by value, walk
+ * the cumulative weight, and return the first value where it reaches half the
+ * total weight. The plain (unweighted) median is the equal-weight special case.
+ */
+function weightedMedian(pairs: { v: number; w: number }[]): number {
+  const sorted = [...pairs].sort((a, b) => a.v - b.v);
+  const total = sorted.reduce((s, p) => s + p.w, 0);
+  if (!(total > 0)) return 0;
+  let acc = 0;
+  for (const p of sorted) {
+    acc += p.w;
+    if (acc >= total / 2) return p.v;
+  }
+  return sorted[sorted.length - 1].v;
+}
+
+/**
+ * Leave-one-out median-residual bias correction for one hour's fit, in log-ratio
+ * units, already shrunk by BIAS_SHRINK (0 when there is too little data to
+ * compute it honestly). For each comparable i, predict its r_h from the OTHER
+ * comparables only (local-linear fit at i's own log hour-1 print, same bandwidth
+ * and clamp as the main fit) and take the residual r_i = actual - predicted.
+ * Those residuals are honest out-of-sample errors: a positive median means the
+ * fit systematically under-predicts, a negative median means it over-predicts.
+ * The correction is the Gaussian-kernel-weighted median of the residuals at the
+ * target's (clamped) log hour-1 print, same bandwidth LOCAL_TAU — the bias near
+ * the target's level, not the pooled bias across all levels. It is computed from
+ * the case's own comparables at run time: no new data, and no leakage of the
+ * target launch (each residual excludes its own launch, and the correction for a
+ * target never uses that target's actuals). The spread is deliberately NOT
+ * recomputed from these residuals — the in-sample local spread of v3 stands.
+ */
+function looBiasCorrection(pts: [number, number][], logP1: number): number {
+  if (pts.length < 8) return 0;
+  const loo: { x: number; r: number }[] = [];
+  for (let i = 0; i < pts.length; i++) {
+    const others = pts.filter((_, j) => j !== i);
+    if (others.length < 5) continue;
+    loo.push({ x: pts[i][0], r: pts[i][1] - localLinearAt(others, pts[i][0]) });
+  }
+  if (loo.length < 8) return 0;
+  const xs = pts.map(([x]) => x);
+  const xc = clamp(logP1, Math.min(...xs) - LEVEL_PAD, Math.max(...xs) + LEVEL_PAD);
+  const pairs = loo.map((e) => ({
+    v: e.r,
+    w: Math.exp(-((e.x - xc) ** 2) / (2 * LOCAL_TAU * LOCAL_TAU)),
+  }));
+  return BIAS_SHRINK * weightedMedian(pairs);
 }
 
 /**
@@ -179,7 +249,9 @@ function localLinearFit(ptsByHour: [number, number][][], logP1: number): { pred:
   const pred: number[] = [];
   const sig: number[] = [];
   for (const pts of ptsByHour) {
-    pred.push(localLinearAt(pts, logP1));
+    // Median log-ratio: the local-linear fit, plus the shrunk LOO median-residual
+    // bias correction (v4). The spread below is unchanged from v3.
+    pred.push(localLinearAt(pts, logP1) + looBiasCorrection(pts, logP1));
     if (pts.length < 5) {
       sig.push(0.8);
       continue;

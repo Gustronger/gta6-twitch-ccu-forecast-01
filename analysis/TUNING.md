@@ -45,20 +45,79 @@ Headline data facts (from the comparables, pooled, 37 launches with valid hour 1
 | Local-linear τ=3.0, resid-σ spread | 0.4114 | 85.4% | 0.899 | too global |
 | Local-linear τ=1.5, mult 0.9 / 1.1 | 0.4028 / 0.4070 | 78.7% | 0.851 / 0.902 | mult 0.9 marginally better loss but coverage at the band edge |
 | **FINAL (v3): local-linear τ=1.5, LOCAL resid-σ, mult 1.0, clamp pad 0.5** | **0.3823** | **78.6%** | **0.888** | harness; tertiles lo 0.635 / mid 0.279 / hi 0.212; worst Black Myth: Wukong 1.625; ELDEN RING 0.119, Cyberpunk 0.123; mult 0.9 → 0.3835, mult 1.1 → 0.3831 (1.0 kept) |
+| **POLISH (v4): v3 + LOO median-residual bias correction, shrunk ×0.5** | **0.3763** | **75.5%** | **0.891** | harness; tertiles lo 0.623 / mid 0.276 / hi 0.210; worst Black Myth: Wukong 1.659; median launch loss 0.257; see § "Polish pass (v4)" below — the only variant in this pass that fixes a measured defect instead of tuning a knob |
 
-## Final model (main.ts v2)
+## Polish pass (v4) — Worker A diagnosis, Worker B implementation (2026-11-17 ~17:15 WIB)
+
+Worker A re-ran the diagnosis on v3 (see `analysis/DIAGNOSIS.md`): v3's median
+is systematically too HIGH — median signed log error +0.10 to +0.20 at most
+hours (hi-tertile +0.215 at h10, +0.199 at h11) — because weighted least
+squares predicts the conditional MEAN while pinball at τ=0.5 wants the
+conditional MEDIAN, and residuals are right-skewed. Spread and bandwidth
+tweaks were re-tested and do NOT beat v3 (mult 0.8 → 0.3870, τ=2.0 → 0.3842).
+The pre-release-history anchor was rejected again (helps overall at τ=2.0 but
+hurts hi-tertile). The kitchen-sink variant (quadratic median + console ×5)
+was NOT shipped: its hi gain is nil and its console weight needs a
+`platforms` field the case schema does not carry for the target.
+
+The shipped fix, per hour h: leave-one-out residuals
+r_i = r_h,i − pred_{−i}(log p1_i) over the comparables (each comparable
+predicted from the others only, same local-linear fit, bandwidth 1.5, clamp
+pad 0.5), then the Gaussian-kernel-weighted median of those residuals at the
+target's clamped log p1 (same bandwidth), × 0.5 shrink, added to the median
+log-ratio. Everything else stays at v3 (τ=1.5, pad 0.5, local spread ×1.0,
+in-sample residuals for the spread, all fallbacks and guards). The correction
+is computed from the case's own comparables at run time — no new data, no
+leakage of the target launch. The shrink sweep (0.25 / 0.5 / 0.75) is a flat
+plateau (0.3783 / 0.3763 / 0.3764); 0.5 halves the unshrunk correction's
+hi-tertile h3–h4 overshoot while keeping most of the h9–h13 fix.
+
+Harness numbers for v4 (official `analysis/backtest.mjs`, 148 pseudo-cases,
+17,020 items), reproduced exactly by my own implementation of the spec —
+0.37632 overall, hi 0.2098, lo 0.6231, mid 0.2755, miss 75.52%, coverage
+0.8907, median launch loss 0.2574, worst Black Myth: Wukong 1.6588 (was
+1.6254 in v3 — the correction slightly worsens the worst launch). The
+numbers match Worker A's lab variant (`/tmp/gta6-lab/variant.mts`,
+LAB_BIAS=med, LAB_BIAS_SHRINK=0.5) to 4 decimals on every reported stat,
+including the per-hour loss line. Practice medians shift down vs v3 as
+predicted: p00 −8.5% (A: −8.4%), p01 −6.0% (−5.9%), p02 −3.4% (−3.4%),
+p03 −5.7% (−5.6%) mean over hours; 90% interval widths are unchanged
+(spread untouched). Plausibly practice 0.188 → ~0.186, if practice tracks
+the hi-tertile LOO proportionally.
+
+Honest caveat (from DIAGNOSIS.md §3, kept here because it decides whether
+this ships): the gain is **not statistically significant** — paired t −1.31
+overall, −0.42 hi (n=37 unique launches; 23/37 better overall, 8/12 hi).
+Recommended on mechanism (it fixes a measured +10–20% median
+miscalibration) plus a consistent small win, not on a significant test. Two
+hi launches regress (Monster Hunter Wilds +0.036, CoD: Black Ops +0.027);
+if the final behaves like one of those, the polish costs ~0.03.
+
+## Final model (main.ts v4 — polish pass, 2026-11-17 ~17:15 WIB)
 
 Per hour h = 2..24, r_h = ln(viewers_h / viewers_1) across comparables (only
 valid hour-1 + hour-h points; missing points skipped, never interpolated).
 Median = per-hour local-linear fit: Gaussian-kernel weighted least squares of
 r_h on log(viewers_1), bandwidth LOCAL_TAU = 1.5, evaluated at the target's
-log(p1) clamped to the comparables' log(p1) range ± LEVEL_PAD = 0.5.
+log(p1) clamped to the comparables' log(p1) range ± LEVEL_PAD = 0.5 — plus the
+v4 bias correction: the kernel-weighted median of the leave-one-out residuals
+at the target's clamped log(p1), × BIAS_SHRINK = 0.5 (see `looBiasCorrection`
+in main.ts; full derivation in analysis/DIAGNOSIS.md §1/§5). The LOO
+residuals are honest out-of-sample errors, so the correction centres the
+median forecast without touching the spread.
 Spread = per-hour residual σ of that fit (residuals at each comparable's own
 log(p1)), × SPREAD_MULT = 1.0, floored at 0.05. q_τ = median · exp(z_τ · σ_h),
 clamped to (0, 1e9], rounded to 2 decimals, forced non-decreasing.
 The GTA VI comparable ("Not a launch" in its unlock note) is excluded from the
 fits, as is any comparable without a valid hour-1 print. Fewer than 8 usable
 comparables → persistence fallback with the house baseline's spread.
+Robustness guard added in the v4 revision pass: an hour with zero usable
+comparable points (found by a phase-locked sparse-hours edge test — see
+Smoke test) now persists hour 1 for that hour instead of emitting NaN; v3
+emitted null quantiles for such an hour, which would have made the whole case
+invalid. The guard cannot change any harness or practice number (no empty
+hour exists in the real data), and both were re-verified byte-identical after
+adding it.
 
 ## Things tried and rejected (why)
 
@@ -81,34 +140,50 @@ comparables → persistence fallback with the house baseline's spread.
 
 ## Final backtest numbers (harness, 148 pseudo-cases, 17,020 items)
 
-- Forecaster: mean loss **0.3823** (v3, local spread — see below), typical miss **78.59%**, 90% coverage **0.8884**,
-  median launch loss 0.2536, failures 0, runtime 0.9 s.
+- Forecaster **v4: mean loss 0.3763**, typical miss **75.52%**, 90% coverage
+  **0.8907**, median launch loss 0.2574, failures 0, runtime 2.0 s for the
+  full backtest (~0.02 s/case). Tertiles lo 0.6231 / mid 0.2755 / hi 0.2098.
+- v3 for comparison: 0.3823 / 78.59% / 0.8884, tertiles lo 0.635 / mid 0.279 /
+  hi 0.212, median launch loss 0.2536. v4 improves every tertile and every
+  hour except h16 (+0.012) and h23 (+0.001); biggest gains h10–h12
+  (−0.011…−0.018) and h18–h19 (−0.017/−0.011).
 - Baseline: mean loss 0.9297, typical miss 213.32%, coverage 0.624, median
-  launch loss 0.3248. Improvement 0.5474 absolute (58.9% relative).
+  launch loss 0.3248. Improvement 0.5533 absolute (59.5% relative).
 - v2 (pooled spread) scored 0.4035 / 78.59% / 0.8837, tertiles lo 0.653 / mid 0.292 / hi 0.244.
   v3 (local spread, adopted by the coordinator after the workers finished):
   0.3823 / 78.59% / 0.8884, tertiles lo 0.635 / mid 0.279 / hi 0.212 — every
   tertile and every hour improved; spread mult 0.9 → 0.3835 and 1.1 → 0.3831,
   so 1.0 kept. Big-launch spot checks: ELDEN RING 0.119, Cyberpunk 0.123
   (baseline ~0.23 each).
-- Worst launch: Black Myth: Wukong (p00) 1.6992 (p1 = 4,941 — simultaneous
+- Worst launch (v4): Black Myth: Wukong (p00) 1.6588 (p1 = 4,941 — simultaneous
   global unlock, China prime-time shape unlike the rest); 2nd worst Marathon
-  ~1.2–1.3. Excluding the two worst launches the mean is ~0.337. One launch
-  dominates the mean, but the median launch loss (0.254) is also far below the
-  baseline's median (0.325), so the win is broad, not one-launch luck.
+  ~1.2–1.3. One launch dominates the mean, but the median launch loss (0.257)
+  is also far below the baseline's median (0.325), so the win is broad, not
+  one-launch luck.
 - Caveat: the backtest scores comparables as pseudo-targets; the 4 practice
   launches themselves are NOT in the pool, and the practice baseline loss
   (0.387) is much lower than the comparable-pool baseline (0.930), so the
-  final-case loss will not be ~0.40 in absolute terms — what transfers is the
-  ~57% relative improvement over baseline on the same launches.
+  final-case loss will not be ~0.38 in absolute terms — what transfers is the
+  ~59% relative improvement over baseline on the same launches.
 
-## Smoke test (main.ts v2, 2026-11-17)
+## Smoke test (main.ts v4, 2026-11-17 ~17:15 WIB)
 
-- `MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=/tmp/gta-out node main.ts`:
+- `MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=/tmp/gta-out-v4 node main.ts`:
   p00–p03.out written, all valid (23 rows, hours 2–24, q finite in (0, 1e9],
-  non-decreasing, ≤ 1,541 bytes), 0.32 s for 4 cases. Second run byte-identical.
+  non-decreasing, ≤ 1,550 bytes), 0.59 s for 4 cases (~0.15 s/case, far inside
+  the 8 s limit). Second run byte-identical. Medians down vs v3 as predicted
+  (p00 −8.5%, p01 −6.0%, p02 −3.4%, p03 −5.7%); 90% interval widths unchanged
+  (ratio 1.000 — spread untouched). Spot values, v4 vs v3: p00 h19 median
+  112,527 (was 134,099), h10 28,943 (was 32,535); p02 h19 304,324 (was
+  331,244) — plausible vs the comparable curves: evening medians are
+  1.1–4.8× hour 1 (p02 1.13×, p01 1.55×, p03 1.53×, p00 4.82×), scaling down
+  with launch size exactly as the level effect predicts, and the biggest
+  launch stays near its hour-1 level rather than exploding.
 - Edge cases (copies in /tmp, kit untouched): streams + categories_hourly
-  present → output identical to p00 (fields ignored gracefully); p1 = 2,000,000
-  (above range) → valid, h19 median 1.63M; p1 = 50 → valid, h19 median 134k;
-  3 or 0 comparables → persistence fallback, valid; sparse hourly points +
-  null/string viewer values → valid.
+  present → output byte-identical to p00 (fields ignored gracefully);
+  p1 = 2,000,000 (above range) → valid, h19 median 1.69M; p1 = 50 → valid,
+  h19 median 180k; 3 or 0 comparables → persistence fallback, valid
+  (h2 median = p1); phase-locked sparse hourly points (whole hours missing
+  across all comparables) → valid after the empty-hour guard: hours with no
+  points persist hour 1, fitted hours unchanged; null viewer values → valid.
+  (The sparse case is what exposed the v3 NaN — see Final model above.)
