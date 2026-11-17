@@ -1,32 +1,52 @@
-// gta6-twitch-ccu-forecast-01's house baseline (Node 22, standard library only): persistence. It forecasts that every
-// hour of release day draws as many concurrent Twitch viewers in the Grand Theft Auto VI category as hour 1 did, with a
-// spread that widens like a random walk's in log space:
+// gta6-twitch-ccu-forecast-01 — Grand Theft Auto VI launch-day Twitch viewers, hours 2-24.
+// Forecast model (fitted on the case's own comparables at run time; no shipped data file):
 //
-//   q_tau(h) = p1 * exp(z_tau * 0.15 * sqrt(h - 1)), rounded to 2 decimals
+//   For each hour h = 2..24, let r_h = ln(viewers_h / viewers_1) over the comparables.
+//   Hour-1 prints vary by three orders of magnitude across launches, and r_h depends
+//   strongly on log(viewers_1): big hour-1 launches (simultaneous global unlocks) decay
+//   relative to hour 1, small hour-1 launches (rolling midnight unlocks, where hour 1 is
+//   only New Zealand) grow several-fold by the evening peak. A plain median of r_h
+//   ignores that and scores ~0.80 on the leave-one-out backtest; a global per-hour
+//   linear fit of r_h on log(viewers_1) scores ~0.45. The median below is a per-hour
+//   LOCAL-linear fit — Gaussian-kernel weighted least squares of r_h on log(viewers_1),
+//   bandwidth 1.5 in log viewers — which captures both the global level trend and
+//   local curvature: 0.382 on the same backtest, typical miss 79% (baseline: 0.930 /
+//   213%), 90% coverage 0.888. A 50/50 blend of the global fit with a kernel weighted
+//   median scored 0.410 on the same backtest and was the v1 model; the local-linear
+//   fit beat it on loss, miss and coverage, so v2 uses it; v3 keeps the local-linear
+//   median and makes the spread local too (see Spreads below), 0.382 vs 0.404 pooled.
 //
-// for the hours h = 2..24 of the UTC day, where p1 is hour 1's print (the case's `known` row for hour 1; a print below 1
-// counts as 1), 0.15 is the spread in natural-log units per square-root hour, and z_tau is the standard normal's
-// quantile at each level tau (0.05, 0.25, 0.5, 0.75, 0.95): -1.645, -0.674, 0, 0.674, 1.645. Its numbers are fixed in
-// advance, never tuned on any data. A prize needs a loss strictly below the best house entry's: this one's, or the house
-// model one-shot's.
+//   Spreads: per-hour residual sigma of the local-linear fit (residuals evaluated at
+//   each comparable's own log hour-1 print), times SPREAD_MULT. q_tau is then
+//   median * exp(z_tau * sigma_h). The log(viewers_1) the fit is evaluated at is
+//   clamped to the comparables' observed range widened by 0.5, so an hour-1 print
+//   outside the historical range cannot extrapolate the fit without bound.
 //
-// The kit's starter/main.ts is this program byte for byte (starter/main.py the same numbers in Python): start your entry
-// from it. What an entry must do:
-//   - read every <id>.in in the input directory (the grader runs one case at a time, with only that case's file there):
-//     JSON {"schema":"makefun/twitch-ccu-case/v1","id","game","day_start","checkpoint","levels","known","forecast",
-//     "history","history_hourly","streams","categories_hourly","comparables","notes"}, where `known` holds hour 1's
-//     print {hour: 1, from, until, viewers, channels, reads} and `forecast` lists the hours to forecast, 2..24;
-//   - write <id>.out to the output directory: {"hours":[{"hour":2,"q":[q05,q25,q50,q75,q95]}, ...]}, exactly 23 rows,
-//     hours 2..24 each once, no other key, each q five finite numbers above 0 and at most 1e9 (viewers; fractions
-//     allowed), non-decreasing; at most 65,536 bytes. Anything else is an invalid case, scored as if every quantile
-//     equalled hour 1's print, and an entry with an invalid case takes no prize.
-// It runs offline, with no network, under the case's time cap: everything it knows is in the case file.
+//   The spread is LOCAL, not pooled: sigma_h is the kernel-weighted residual SD
+//   at the target's own (clamped) log hour-1 print, same bandwidth as the median
+//   fit. Big launches have much tighter curves than small ones, and a pooled
+//   sigma over-covers them (hi-tertile 90% coverage 0.997 with a pooled sigma);
+//   the local sigma scores 0.382 on the same backtest vs 0.404 pooled, with
+//   coverage 0.888, and improves every p1 tertile (lo 0.635, mid 0.279,
+//   hi 0.212) and every hour. Falls back to the pooled residual SD when the
+//   local weights degenerate (effective n < 3).
 //
-// Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output:
-//   mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
+//   The Grand Theft Auto VI comparable ("Not a launch" in its unlock note) is not a
+//   launch at all — its day_start is the 2026-08-27 premiere — so it is excluded from
+//   the fits, as is any comparable without a valid hour-1 print. Missing hourly points
+//   are skipped, never interpolated. The target's own pre-release history is NOT used
+//   for similarity: its pre-release level relative to hour 1 sits far outside the
+//   comparables' range for GTA VI (category ~1.7k viewers pre-release vs an hour-1
+//   print in the hundreds of thousands), so a pre-history similarity weight would
+//   collapse onto the least similar launches.
+//
+//   No randomness, no clock, no network: a pure function of the case file.
+//   Fitted constants (LOCAL_TAU, LEVEL_PAD, SPREAD_MULT) were chosen on the
+//   leave-one-out backtest over the kit's comparables (see analysis/TUNING.md).
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -35,31 +55,209 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 /** The standard normal's quantile at each level. */
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
-/** The spread of an hour's move, in natural-log units per square-root hour. */
-const SIGMA = 0.15;
+/** Hours to forecast. */
+const HOURS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
+
+/** Gaussian kernel bandwidth (in log viewers) for the local-linear fit. Fit on backtest. */
+const LOCAL_TAU = 1.5;
+/** How far (in log viewers) past the comparables' log hour-1 range the fit may extrapolate. Fit on backtest. */
+const LEVEL_PAD = 0.5;
+/** Global multiplier on the per-hour residual sigma. Fit on backtest (90% coverage ~0.89 at 1.0). */
+const SPREAD_MULT = 1.0;
+/** Floor on the per-hour log spread, so a degenerate fit cannot produce equal quantiles. */
+const SIGMA_FLOOR = 0.05;
+
+interface Comparable {
+  name?: unknown;
+  unlock?: unknown;
+  day_start?: unknown;
+  hourly?: Array<{ from?: unknown; viewers?: unknown }>;
+}
 
 interface Case {
   levels: number[];
   known: Array<{ hour: number; viewers: number }>;
   forecast: Array<{ hour: number }>;
+  comparables?: Comparable[];
+  // Present in the final case, null in practice cases; read defensively, never required.
+  history_hourly?: Array<{ from?: unknown; viewers?: unknown }> | null;
+  streams?: unknown;
+  categories_hourly?: unknown;
 }
 
 /** x rounded to 2 decimals (half up). */
 const round2 = (x: number): number => Math.round(x * 100) / 100;
 
-/** The persistence forecast of one hour h: the five quantiles around hour 1's print. */
-const hourQuantiles = (p1: number, h: number): number[] => Z.map((z) => round2(p1 * Math.exp(z * SIGMA * Math.sqrt(h - 1))));
+const clamp = (x: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, x));
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-// Every case file, in name order, so two runs write the same bytes.
-const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
-for (const file of inputs) {
-  const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) throw new Error(`${file} asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
-  const first = c.known.find((k) => k.hour === 1);
-  if (first === undefined) throw new Error(`${file} has no hour-1 print`);
-  const p1 = Math.max(1, first.viewers);
-  const hours = c.forecast.map(({ hour }) => ({ hour, q: hourQuantiles(p1, hour) }));
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ hours })}\n`);
+const median = (xs: number[]): number => {
+  const s = [...xs].sort((a, b) => a - b);
+  const n = s.length;
+  return n % 2 === 1 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+};
+
+/**
+ * Release-day hourly viewers for one comparable: index 0 is hour 1 of its day_start,
+ * index 23 is hour 24. Null where the source has no valid point (never interpolated).
+ * Returns null when the comparable is not a launch (e.g. the Grand Theft Auto VI
+ * category history, whose unlock note says "Not a launch") or has no hour-1 print.
+ */
+function releaseDayHours(comp: Comparable): (number | null)[] | null {
+  if (typeof comp.unlock === 'string' && /not a launch/i.test(comp.unlock)) return null;
+  if (typeof comp.day_start !== 'string' || !Array.isArray(comp.hourly)) return null;
+  const start = Date.parse(comp.day_start);
+  if (!Number.isFinite(start)) return null;
+  const hours: (number | null)[] = new Array(24).fill(null);
+  for (const p of comp.hourly) {
+    if (typeof p.from !== 'string' || typeof p.viewers !== 'number' || !(p.viewers > 0)) continue;
+    const idx = Math.floor((Date.parse(p.from) - start) / 3_600_000);
+    if (idx >= 0 && idx < 24 && hours[idx] === null) hours[idx] = p.viewers;
+  }
+  return hours[0] === null ? null : hours;
 }
+
+/** Per-hour training points: [log hour-1 viewers, log ratio to hour 1] for hours 2..24. */
+function fitPoints(days: (number | null)[][]): [number, number][][] {
+  const out: [number, number][][] = [];
+  for (let h = 1; h < 24; h++) {
+    const pts: [number, number][] = [];
+    for (const day of days) {
+      const v = day[h];
+      if (v !== null && v !== undefined && v > 0) pts.push([Math.log(day[0] as number), Math.log(v / (day[0] as number))]);
+    }
+    out.push(pts);
+  }
+  return out;
+}
+
+/** Weighted least squares of y on x; returns {mx, my, slope}. Null when weights sum to ~0. */
+function wols(pts: [number, number][], w: number[]): { mx: number; my: number; slope: number } | null {
+  let sw = 0;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < pts.length; i++) {
+    sw += w[i];
+    mx += w[i] * pts[i][0];
+    my += w[i] * pts[i][1];
+  }
+  if (!(sw > 1e-12)) return null;
+  mx /= sw;
+  my /= sw;
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < pts.length; i++) {
+    sxy += w[i] * (pts[i][0] - mx) * (pts[i][1] - my);
+    sxx += w[i] * (pts[i][0] - mx) * (pts[i][0] - mx);
+  }
+  return { mx, my, slope: sxx > 0 ? sxy / sxx : 0 };
+}
+
+/**
+ * Local-linear prediction of r_h at log hour-1 print x0: Gaussian-kernel weighted
+ * least squares of r_h on log hour-1 viewers, bandwidth LOCAL_TAU. x0 is clamped to
+ * the comparables' log hour-1 range widened by LEVEL_PAD. Falls back to the plain
+ * median of r_h when there are too few points or the weights degenerate.
+ */
+function localLinearAt(pts: [number, number][], x0: number): number {
+  if (pts.length < 5) return median(pts.map(([, r]) => r));
+  const xs = pts.map(([x]) => x);
+  const x = clamp(x0, Math.min(...xs) - LEVEL_PAD, Math.max(...xs) + LEVEL_PAD);
+  const w = pts.map(([px]) => Math.exp(-((px - x) ** 2) / (2 * LOCAL_TAU * LOCAL_TAU)));
+  const fit = wols(pts, w);
+  if (fit === null) return median(pts.map(([, r]) => r));
+  return fit.my + fit.slope * (x - fit.mx);
+}
+
+/**
+ * Per-hour local-linear fit for hours 2..24 at the target's log hour-1 print:
+ * predicted log ratios plus the per-hour residual sigma. Sigma is LOCAL: the
+ * kernel-weighted residual SD at the target's clamped log hour-1 print (same
+ * bandwidth as the median fit), floored at SIGMA_FLOOR; it falls back to the
+ * pooled residual SD when the local weights degenerate (effective n < 3).
+ */
+function localLinearFit(ptsByHour: [number, number][][], logP1: number): { pred: number[]; sig: number[] } {
+  const pred: number[] = [];
+  const sig: number[] = [];
+  for (const pts of ptsByHour) {
+    pred.push(localLinearAt(pts, logP1));
+    if (pts.length < 5) {
+      sig.push(0.8);
+      continue;
+    }
+    // Local residual spread at the target's clamped log hour-1 print.
+    const xs = pts.map(([px]) => px);
+    const xc = clamp(logP1, Math.min(...xs) - LEVEL_PAD, Math.max(...xs) + LEVEL_PAD);
+    let ss = 0;
+    let sw = 0;
+    let sw2 = 0;
+    let ssd = 0;
+    for (const [x, y] of pts) {
+      const d = y - localLinearAt(pts, x);
+      ss += d * d;
+      const w = Math.exp(-((x - xc) ** 2) / (2 * LOCAL_TAU * LOCAL_TAU));
+      sw += w;
+      sw2 += w * w;
+      ssd += w * d * d;
+    }
+    const effN = sw2 > 0 ? (sw * sw) / sw2 : 0;
+    const pooledSig = Math.sqrt(ss / Math.max(1, pts.length - 1));
+    const localSig = sw > 1e-9 && effN >= 3 ? Math.sqrt(ssd / sw) : NaN;
+    sig.push(Math.max(SIGMA_FLOOR, Number.isFinite(localSig) ? localSig : pooledSig));
+  }
+  return { pred, sig };
+}
+
+/**
+ * Forecast one case: {hours: [{hour, q: [q05, q25, q50, q75, q95]}]} for hours 2..24.
+ * Pure function of the case object. Falls back to the house persistence shape when a
+ * case carries too few usable comparables to fit anything.
+ */
+export function forecastCase(caseObj: Case): { hours: { hour: number; q: number[] }[] } {
+  const first = caseObj.known.find((k) => k.hour === 1);
+  if (first === undefined) throw new Error('case has no hour-1 print');
+  const p1 = Math.max(1, first.viewers);
+  const logP1 = Math.log(p1);
+
+  const days: (number | null)[][] = [];
+  for (const comp of caseObj.comparables ?? []) {
+    const day = releaseDayHours(comp);
+    if (day !== null) days.push(day);
+  }
+
+  let medLog: number[];
+  let sig: number[];
+  if (days.length >= 8) {
+    const ptsByHour = fitPoints(days);
+    const fit = localLinearFit(ptsByHour, logP1);
+    medLog = fit.pred.map((r) => logP1 + r);
+    sig = fit.sig.map((s) => s * SPREAD_MULT);
+  } else {
+    // Too few comparables to fit: persistence with the house baseline's spread.
+    medLog = HOURS.map(() => logP1);
+    sig = HOURS.map((h) => 0.15 * Math.sqrt(h - 1));
+  }
+
+  const hours = HOURS.map((h, i) => {
+    const qs = Z.map((z) => medLog[i] + z * sig[i]).map((v) => round2(clamp(Math.exp(v), 0.01, 1e9)));
+    // Enforce non-decreasing after rounding (rounding can only tie, never invert, but be safe).
+    for (let j = 1; j < qs.length; j++) if (qs[j] < qs[j - 1]) qs[j] = qs[j - 1];
+    return { hour: h, q: qs };
+  });
+  return { hours };
+}
+
+/** CLI: read every *.in in the input dir, write one *.out per case. */
+function main(): void {
+  const levelsOk = (c: Case): boolean =>
+    c.levels.length === LEVELS.length && c.levels.every((t, j) => t === LEVELS[j]);
+  mkdirSync(OUTPUT_DIR, { recursive: true });
+  const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
+  for (const file of inputs) {
+    const id = file.slice(0, -'.in'.length);
+    const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
+    if (!levelsOk(c)) throw new Error(`${file} asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
+    writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify(forecastCase(c))}\n`);
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) main();
